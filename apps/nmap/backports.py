@@ -37,52 +37,158 @@ def compare_debian_versions(v1: str, v2: str) -> int:
         return -1
     return 0
 
+def _rpm_segment_compare(left: str, right: str) -> int:
+    """Compare a VERSION or RELEASE component using rpmvercmp ordering."""
+    i = j = 0
+
+    def is_digit(char: str) -> bool:
+        return "0" <= char <= "9"
+
+    def is_alpha(char: str) -> bool:
+        return "a" <= char <= "z" or "A" <= char <= "Z"
+
+    def is_alnum(char: str) -> bool:
+        return is_digit(char) or is_alpha(char)
+
+    while i < len(left) or j < len(right):
+        while i < len(left) and not (is_alnum(left[i]) or left[i] in "~^"):
+            i += 1
+        while j < len(right) and not (is_alnum(right[j]) or right[j] in "~^"):
+            j += 1
+
+        first = left[i] if i < len(left) else ""
+        second = right[j] if j < len(right) else ""
+
+        # Tilde sorts below everything, including a missing segment.
+        if first == "~" or second == "~":
+            if first != "~":
+                return 1
+            if second != "~":
+                return -1
+            i += 1
+            j += 1
+            continue
+
+        # Caret sorts after the bare version, but before the next segment.
+        if first == "^" or second == "^":
+            if not first:
+                return -1
+            if not second:
+                return 1
+            if first != "^":
+                return 1
+            if second != "^":
+                return -1
+            i += 1
+            j += 1
+            continue
+
+        if not first or not second:
+            break
+
+        numeric = is_digit(first)
+        start_i, start_j = i, j
+        if numeric:
+            while i < len(left) and is_digit(left[i]):
+                i += 1
+            while j < len(right) and is_digit(right[j]):
+                j += 1
+        else:
+            while i < len(left) and is_alpha(left[i]):
+                i += 1
+            while j < len(right) and is_alpha(right[j]):
+                j += 1
+
+        one, two = left[start_i:i], right[start_j:j]
+        if not two:
+            # Numeric segments always sort after alphabetic segments.
+            return 1 if numeric else -1
+
+        if numeric:
+            one, two = one.lstrip("0") or "0", two.lstrip("0") or "0"
+            if len(one) != len(two):
+                return 1 if len(one) > len(two) else -1
+        if one != two:
+            return 1 if one > two else -1
+
+    return (i < len(left)) - (j < len(right))
+
+
+def compare_rpm_versions(v1: str, v2: str) -> int:
+    """Compare RPM epoch:version-release values, with missing epoch = 0.
+
+    Compare epoch first, then version and release separately using RPM rules.
+    Unlike stripping epochs, this cannot mark an older epoch as patched.
+    """
+
+    def split_evr(value: str):
+        epoch = 0
+        prefix, sep, suffix = value.partition(":")
+        if sep and prefix.isascii() and prefix.isdecimal():
+            epoch = int(prefix)
+            value = suffix
+        version, sep, release = value.partition("-")
+        return epoch, version, release if sep else ""
+
+    epoch1, version1, release1 = split_evr(v1)
+    epoch2, version2, release2 = split_evr(v2)
+    if epoch1 != epoch2:
+        return 1 if epoch1 > epoch2 else -1
+
+    result = _rpm_segment_compare(version1, version2)
+    if result:
+        return result
+    return _rpm_segment_compare(release1, release2)
+
+
+# Distro marker -> canonical backports.json key -> version family.
+# Alpine is tracked separately in #575 because its nmap banner format
+# needs independent verification. Adding a source here does not assume
+# an unverified Alpine suffix format.
+_DISTRO_RULES = (
+    (re.compile(r"(?i)\bubuntu\b"), "ubuntu", "deb"),
+    (re.compile(r"(?i)\bdebian\b"), "debian", "deb"),
+    (re.compile(r"(?i)\b(?:sles|opensuse|suse)\b"), "suse", "rpm"),
+    (
+        re.compile(
+            r"(?i)\b(?:rhel|red\s+hat|rocky(?:\s+linux)?|alma(?:linux)?|centos|oracle\s+linux)\b"
+        ),
+        "redhat",
+        "rpm",
+    ),
+)
+
+# Require a recognizable distro package-build suffix. A version mentioned in
+# generic service metadata (e.g. "Ubuntu Linux; protocol 2.0") must not cause
+# a false security demotion.
+_DEB_VERSION_RE = r"[-;]\s*(\d[a-z0-9.~+-]*)"
+_RPM_VERSION_RE = (
+    r"(?:[\s;:-]+)((?:[0-9]+:)?[0-9][0-9A-Za-z._~+]*-[0-9A-Za-z._~+]+)"
+    r"(?![0-9A-Za-z._~+])"
+)
+
+
 def check_backport(product: str, version_string: str, cve: str) -> dict:
-    """
-    Checks if a CVE has been patched via backport based on the version string.
-    Returns a dict with demote information if a backport is applied, else None.
-    """
-    if not version_string or not product:
+    """Only demote a CVE when the installed distro build meets the fixed build."""
+    if not product or not version_string:
         return None
 
     product = product.lower()
+    for marker, distro, family in _DISTRO_RULES:
+        match = marker.search(version_string)
+        if match is None:
+            continue
+        expression = _RPM_VERSION_RE if family == "rpm" else _DEB_VERSION_RE
+        build = re.search(expression, version_string[match.end():])
+        if build is None:
+            continue
 
-    # Identify distro and distro-specific version from nmap extrainfo strings.
-    # Examples:
-    #   "OpenSSH 9.6p1 Ubuntu Linux; protocol 2.0"   → no version suffix (skip)
-    #   "OpenSSH 9.6p1 Ubuntu-3ubuntu13.4"            → distro_version = "3ubuntu13.4"
-    #   "OpenSSH 8.4p1 Debian-5+deb11u3"              → distro_version = "5+deb11u3"
-    #   "OpenSSH 9.6p1 Ubuntu Linux; 3ubuntu13.3"     → distro_version = "3ubuntu13.3"
-    # We specifically require the suffix to START with a digit to avoid capturing
-    # words like "protocol" that appear in the common "Ubuntu Linux; protocol 2.0" format.
-    match = re.search(r'(?i)(ubuntu|debian)(?:[^;]*?[-; ])\s*(\d[a-z0-9.~+-]*)', version_string)
+        fixed = BACKPORTS.get(distro, {}).get(cve, {}).get(product)
+        if not fixed:
+            continue
 
-    distro = None
-    distro_version = None
-
-    if match:
-        distro = match.group(1).lower()
-        distro_version = match.group(2).strip()
-
-    if not distro or not distro_version:
-        return None
-
-    distro_data = BACKPORTS.get(distro, {})
-    cve_data = distro_data.get(cve)
-    if not cve_data:
-        return None
-
-    # Get the fixed version for this product
-    fixed_version = cve_data.get(product)
-    if not fixed_version:
-        return None
-
-    # Compare distro_version with fixed_version
-    # If installed version >= fixed_version, it is patched
-    if compare_debian_versions(distro_version, fixed_version) >= 0:
-        return {
-            "backport_applied": True,
-            "first_fixed_in": fixed_version
-        }
+        comparator = compare_rpm_versions if family == "rpm" else compare_debian_versions
+        if comparator(build.group(1), fixed) >= 0:
+            return {"backport_applied": True, "first_fixed_in": fixed}
 
     return None
