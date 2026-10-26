@@ -115,3 +115,83 @@ class TestCheckBackport:
         assert check_backport(
             "openssh", "OpenSSH 9.6p1", "CVE-2024-6387"
         ) is None
+
+
+# ---------------------------------------------------------------------------
+# RPM EVR comparison and RPM distro backport lookups (#576)
+# ---------------------------------------------------------------------------
+
+import pytest
+
+from apps.nmap.backports import compare_rpm_versions
+
+
+@pytest.mark.parametrize(
+    "installed, fixed, expected",
+    [
+        ("1.2.3-10.el9", "1.2.3-1.el9", 1),
+        ("2:1.0-1", "1:9.9-9", 1),
+        ("0:1.0-1", "1.0-1", 0),
+        ("1:0.1-1", "9.9-9", 1),
+        ("1.0~rc1", "1.0", -1),
+        ("1.0^git1", "1.0", 1),
+        ("1.0^git1", "1.0.1", -1),
+        ("1.0^git1", "1.0a", -1),
+        ("1.0a", "1.0.1", -1),
+        ("1.2.03", "1.2.3", 0),
+        ("1.0-1.el9", "1.0-2.el9", -1),
+        ("2.4.51-150000.15.35.1", "2.4.51-150000.15.30.1", 1),
+        ("1.0~rc1", "1.0^git1", -1),
+        ("1.a", "1.1", -1),
+        ("1.0+1", "1.0.1", 0),
+        ("1.0-1", "1.0", 1),
+    ],
+)
+def test_rpm_evr_ordering(installed, fixed, expected):
+    assert compare_rpm_versions(installed, fixed) == expected
+    assert compare_rpm_versions(fixed, installed) == -expected
+
+
+_RPM_BACKPORTS = {
+    "suse": {"CVE-2026-1234": {"httpd": "2.4.51-150000.15.35.1"}},
+    "redhat": {"CVE-2024-6387": {"openssh": "1:8.0p1-1.el9"}},
+}
+
+
+@pytest.mark.parametrize("marker", ["SUSE", "SLES", "openSUSE", "openSUSE Leap"])
+@patch("apps.nmap.backports.BACKPORTS", _RPM_BACKPORTS)
+def test_suse_fixed_build_demoted(marker):
+    assert check_backport(
+        "httpd",
+        f"httpd 2.4.51 {marker} 2.4.51-150000.15.35.1",
+        "CVE-2026-1234",
+    ) == {"backport_applied": True, "first_fixed_in": "2.4.51-150000.15.35.1"}
+
+
+@pytest.mark.parametrize("marker", ["Red Hat", "RHEL", "Rocky Linux", "AlmaLinux", "CentOS"])
+@patch("apps.nmap.backports.BACKPORTS", _RPM_BACKPORTS)
+def test_redhat_family_fixed_build_demoted(marker):
+    assert check_backport(
+        "openssh", f"OpenSSH 8.0p1 {marker} 1:8.0p1-1.el9", "CVE-2024-6387"
+    ) == {"backport_applied": True, "first_fixed_in": "1:8.0p1-1.el9"}
+
+
+@patch("apps.nmap.backports.BACKPORTS", _RPM_BACKPORTS)
+def test_rpm_older_build_must_not_be_demoted():
+    assert check_backport(
+        "httpd", "httpd 2.4.51 SUSE 2.4.51-150000.15.30.1", "CVE-2026-1234"
+    ) is None
+
+
+@patch("apps.nmap.backports.BACKPORTS", _RPM_BACKPORTS)
+def test_rpm_lower_epoch_must_not_be_demoted():
+    assert check_backport(
+        "openssh", "OpenSSH 8.0p1 RHEL 0:9.0p1-9.el9", "CVE-2024-6387"
+    ) is None
+
+
+@patch("apps.nmap.backports.BACKPORTS", _RPM_BACKPORTS)
+def test_rpm_banner_without_package_build_must_not_be_demoted():
+    assert check_backport(
+        "httpd", "Apache httpd 2.4.51 openSUSE Leap 15.6", "CVE-2026-1234"
+    ) is None
